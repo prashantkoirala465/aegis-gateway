@@ -1,18 +1,24 @@
 import json
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response, StreamingResponse
 
 from aegis_gateway.api.deps import (
     get_budget_script,
+    get_db_session,
+    get_injection_detector,
+    get_pii_redactor,
     get_provider_registry,
     get_redis,
     get_token_bucket_script,
 )
 from aegis_gateway.core.logging import get_logger
+from aegis_gateway.detectors.pii import PiiRedactor, redact_messages
+from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
 from aegis_gateway.middleware.auth import get_current_tenant
 from aegis_gateway.providers.base import Provider
 from aegis_gateway.providers.errors import ProviderError, provider_error_to_http_exception
@@ -20,6 +26,7 @@ from aegis_gateway.providers.registry import ProviderRegistry, UnknownProviderEr
 from aegis_gateway.schemas.auth import TenantContext
 from aegis_gateway.schemas.chat import ChatCompletionRequest, Usage
 from aegis_gateway.schemas.errors import openai_error
+from aegis_gateway.services.audit import write_audit_event
 from aegis_gateway.services.idempotency import (
     get_cached_response,
     release_lock,
@@ -66,27 +73,91 @@ def _rate_limit_http_exception(exc: RateLimitExceeded) -> HTTPException:
     )
 
 
+async def _run_security_pipeline(
+    *,
+    body: ChatCompletionRequest,
+    tenant: TenantContext,
+    session: AsyncSession,
+    correlation_id: str | None,
+    pii_redactor: PiiRedactor,
+    injection_detector: PromptInjectionDetector,
+) -> ChatCompletionRequest:
+    """Runs after rate limiting/concurrency (see chat_completions) so an obviously
+    abusive request rate can't burn PII/injection-detection compute — that ordering
+    is deliberate, see docs/THREAT_MODEL.md. Returns a copy of `body` with PII-
+    redacted message content (what actually gets sent upstream); raises
+    HTTPException(403) if prompt injection is flagged and the tenant's mode is
+    "block". A "log" verdict is recorded but the request proceeds.
+    """
+    messages = body.messages
+
+    if tenant.pii_redaction_enabled:
+        messages, entity_types = await redact_messages(pii_redactor, messages)
+        if entity_types:
+            await write_audit_event(
+                session,
+                tenant_id=tenant.tenant_id,
+                event_type="pii.redacted",
+                correlation_id=correlation_id,
+                detail={"entity_types": list(entity_types)},
+            )
+
+    if tenant.injection_detection_enabled:
+        user_text = "\n".join(
+            m.content for m in messages if m.role == "user" and isinstance(m.content, str)
+        )
+        verdict = await injection_detector.detect(user_text)
+        if verdict.score >= tenant.injection_detection_threshold:
+            blocked = tenant.injection_detection_mode == "block"
+            await write_audit_event(
+                session,
+                tenant_id=tenant.tenant_id,
+                event_type="injection.blocked" if blocked else "injection.detected",
+                correlation_id=correlation_id,
+                detail={
+                    "score": round(verdict.score, 3),
+                    "matched_heuristic": verdict.matched_heuristic,
+                    "matched_embedding": verdict.matched_embedding,
+                    "mode": tenant.injection_detection_mode,
+                },
+            )
+            if blocked:
+                raise HTTPException(
+                    status_code=403,
+                    detail=openai_error(
+                        "Request flagged as a likely prompt injection attempt.",
+                        error_type="invalid_request_error",
+                        code="prompt_injection_detected",
+                    ),
+                )
+
+    return body.model_copy(update={"messages": messages})
+
+
 @router.post("/chat/completions")
 async def chat_completions(
+    request: Request,
     body: ChatCompletionRequest,
     tenant: TenantContext = Depends(get_current_tenant),
+    session: AsyncSession = Depends(get_db_session),
     redis: Redis = Depends(get_redis),
     registry: ProviderRegistry = Depends(get_provider_registry),
     token_bucket_script: AsyncScript = Depends(get_token_bucket_script),
     budget_script: AsyncScript = Depends(get_budget_script),
+    pii_redactor: PiiRedactor = Depends(get_pii_redactor),
+    injection_detector: PromptInjectionDetector = Depends(get_injection_detector),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Response:
-    """OpenAI-compatible chat completions. The PII/prompt-injection security pipeline
-    lands in Phase 4, wrapping this same core: auth, rate limiting, idempotency,
-    routing, retries/circuit-breaker (in the provider adapter), streaming, and
-    approximate token counting.
+    """OpenAI-compatible chat completions.
 
     Enforcement order: idempotency replay/lock (cheapest — a pure cache hit skips
     everything below) -> rate limits (RPM/TPM/budget, gates the expensive stuff) ->
-    concurrency slot (held for the full call/stream duration) -> the actual provider
-    call. See services/rate_limiter.py for why RPM/TPM/budget need one atomic Lua
-    round trip each but concurrency doesn't.
+    concurrency slot (held for the full call/stream duration) -> PII redaction +
+    prompt-injection detection (CPU/latency-costly, deliberately gated behind rate
+    limiting) -> the actual provider call, using the redacted message content.
     """
+    correlation_id = getattr(request.state, "correlation_id", None)
+
     if idempotency_key and not body.stream:
         cached = await get_cached_response(redis, tenant.tenant_id, idempotency_key)
         if cached is not None:
@@ -151,6 +222,21 @@ async def chat_completions(
             ),
             headers={"Retry-After": "1"},
         )
+
+    try:
+        body = await _run_security_pipeline(
+            body=body,
+            tenant=tenant,
+            session=session,
+            correlation_id=correlation_id,
+            pii_redactor=pii_redactor,
+            injection_detector=injection_detector,
+        )
+    except HTTPException:
+        await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
+        if idempotency_key:
+            await release_lock(redis, tenant.tenant_id, idempotency_key)
+        raise
 
     if body.stream:
         return StreamingResponse(

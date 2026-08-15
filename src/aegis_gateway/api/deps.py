@@ -6,6 +6,8 @@ from redis.commands.core import AsyncScript
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegis_gateway.core.config import Settings
+from aegis_gateway.detectors.pii import PiiRedactor
+from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
 from aegis_gateway.providers.registry import ProviderRegistry
 
 
@@ -38,3 +40,13 @@ def get_token_bucket_script(request: Request) -> AsyncScript:
 def get_budget_script(request: Request) -> AsyncScript:
     script: AsyncScript = request.app.state.budget_script
     return script
+
+
+def get_pii_redactor(request: Request) -> PiiRedactor:
+    redactor: PiiRedactor = request.app.state.pii_redactor
+    return redactor
+
+
+def get_injection_detector(request: Request) -> PromptInjectionDetector:
+    detector: PromptInjectionDetector = request.app.state.injection_detector
+    return detector

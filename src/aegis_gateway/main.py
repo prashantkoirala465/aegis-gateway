@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,8 @@ from aegis_gateway.core.config import get_settings
 from aegis_gateway.core.logging import configure_logging, get_logger
 from aegis_gateway.db.redis import build_redis_client, build_redis_pool
 from aegis_gateway.db.session import build_engine, build_sessionmaker
+from aegis_gateway.detectors.pii import PiiRedactor
+from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
 from aegis_gateway.middleware.request_id import CorrelationIdMiddleware
 from aegis_gateway.providers.registry import build_provider_registry
 from aegis_gateway.services.rate_limiter import register_rate_limit_scripts
@@ -48,6 +51,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     providers = build_provider_registry(settings, client=provider_http_client)
     token_bucket_script, budget_script = register_rate_limit_scripts(redis_client)
 
+    # PiiRedactor() loads a spaCy model — CPU-bound and slow enough (hundreds of ms)
+    # to run off the event loop even at startup, not just per-request.
+    pii_redactor = await asyncio.to_thread(PiiRedactor)
+    injection_detector = PromptInjectionDetector(
+        http_client=provider_http_client, api_key=settings.openai_api_key
+    )
+    await injection_detector.warm_up()
+
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
@@ -55,6 +66,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.providers = providers
     app.state.token_bucket_script = token_bucket_script
     app.state.budget_script = budget_script
+    app.state.pii_redactor = pii_redactor
+    app.state.injection_detector = injection_detector
 
     logger.info("startup.complete", environment=settings.environment)
     try:

@@ -55,6 +55,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
       - run: uv pip install --system ".[dev]"
+      - run: python -m spacy download en_core_web_sm
       - run: alembic upgrade head
       - run: pytest --cov=aegis_gateway --cov-report=term-missing
 

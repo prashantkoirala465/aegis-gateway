@@ -13,6 +13,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN uv pip install --system --no-cache .
+RUN python -m spacy download en_core_web_sm
 
 COPY alembic ./alembic
 COPY alembic.ini ./

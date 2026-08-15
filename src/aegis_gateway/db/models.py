@@ -18,6 +18,10 @@ class Tenant(Base):
     rate_limit_rpm: Mapped[int] = mapped_column(default=60)
     rate_limit_tpm: Mapped[int] = mapped_column(default=100_000)
     max_concurrent_requests: Mapped[int] = mapped_column(default=5)
+    pii_redaction_enabled: Mapped[bool] = mapped_column(default=True)
+    injection_detection_enabled: Mapped[bool] = mapped_column(default=True)
+    injection_detection_threshold: Mapped[float] = mapped_column(default=0.75)
+    injection_detection_mode: Mapped[str] = mapped_column(String(16), default="block")
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

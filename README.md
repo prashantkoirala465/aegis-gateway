@@ -5,11 +5,14 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 3 of 9. Tenants, API keys, Postgres RLS, and auth are in;
+Status: Phase 4 of 9. Tenants, API keys, Postgres RLS, and auth are in;
 `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
-circuit breaker per provider, and idempotency keys; every request is now gated by
-per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap,
-all enforced atomically in Redis. The PII/prompt-injection pipeline is next.
+circuit breaker per provider, and idempotency keys; every request is gated by
+per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap;
+and message content is now run through Presidio-based PII redaction and heuristic +
+embedding-similarity prompt-injection detection before it reaches a provider, with
+every redaction, block, and auth failure written to a synchronous audit log. Cost
+tracking and usage rollups are next.
 
 ## Architecture
 
@@ -49,6 +52,16 @@ Every tenant has per-request limits — `rate_limit_rpm`, `rate_limit_tpm`,
 scripts (a plain get-then-set is a race under concurrent requests) before a request
 reaches the provider. No admin API to change them yet (Phase 8); for now, set them on
 the `tenants` row directly.
+
+Message content is redacted for PII (Presidio: spaCy NER + built-in regex recognizers)
+before it reaches a provider, unless a tenant has `pii_redaction_enabled=false`. Prompt-
+injection detection runs regex heuristics plus, when `OPENAI_API_KEY` is set, cosine
+similarity against a small embedded jailbreak corpus — best-effort defense-in-depth, not
+a robust guarantee; it degrades to heuristic-only (logged once, not per request) with no
+API key configured. Each tenant picks `injection_detection_mode`: `block` (403) or `log`
+(allowed through, recorded). Every redaction, injection verdict, and auth failure writes
+a synchronous row to `audit_log` — never queued, and never containing raw prompt/PII
+content, only categories and scores.
 
 ## Quickstart
 
