@@ -58,6 +58,9 @@ ignore = ["S101", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106"]
+# Module-level Lua source constants (_TOKEN_BUCKET_LUA, _BUDGET_LUA) trip S105's
+# hardcoded-password heuristic on the variable name; they're Redis scripts, not secrets.
+"src/aegis_gateway/services/rate_limiter.py" = ["S105"]
 
 [tool.mypy]
 python_version = "3.12"

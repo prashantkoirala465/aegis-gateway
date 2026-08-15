@@ -53,4 +53,12 @@ async def get_current_tenant(
     api_key.last_used_at = datetime.now(UTC)
     await session.commit()
 
-    return TenantContext(tenant_id=tenant.id, tenant_name=tenant.name, api_key_id=api_key.key_id)
+    return TenantContext(
+        tenant_id=tenant.id,
+        tenant_name=tenant.name,
+        api_key_id=api_key.key_id,
+        monthly_budget_usd=tenant.monthly_budget_usd,
+        rate_limit_rpm=tenant.rate_limit_rpm,
+        rate_limit_tpm=tenant.rate_limit_tpm,
+        max_concurrent_requests=tenant.max_concurrent_requests,
+    )

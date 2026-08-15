@@ -5,10 +5,11 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 2 of 9. Tenants, API keys, Postgres RLS, and auth are in, and
+Status: Phase 3 of 9. Tenants, API keys, Postgres RLS, and auth are in;
 `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
-circuit breaker per provider, and idempotency keys. Rate limiting and the PII/prompt-
-injection pipeline are next.
+circuit breaker per provider, and idempotency keys; every request is now gated by
+per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap,
+all enforced atomically in Redis. The PII/prompt-injection pipeline is next.
 
 ## Architecture
 
@@ -42,6 +43,12 @@ API keys are HMAC-SHA256 with a server-side pepper (indexable, no bcrypt-on-ever
 cost); admin passwords use argon2id. Postgres RLS enforces tenant isolation at the row
 level, on top of the normal application-side `WHERE tenant_id = ...` filtering — the app
 connects as a non-superuser role so the policies actually apply.
+
+Every tenant has per-request limits — `rate_limit_rpm`, `rate_limit_tpm`,
+`monthly_budget_usd`, `max_concurrent_requests` — enforced atomically in Redis via Lua
+scripts (a plain get-then-set is a race under concurrent requests) before a request
+reaches the provider. No admin API to change them yet (Phase 8); for now, set them on
+the `tenants` row directly.
 
 ## Quickstart
 

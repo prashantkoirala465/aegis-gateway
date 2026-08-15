@@ -15,6 +15,9 @@ class Tenant(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     monthly_budget_usd: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("100.00"))
+    rate_limit_rpm: Mapped[int] = mapped_column(default=60)
+    rate_limit_tpm: Mapped[int] = mapped_column(default=100_000)
+    max_concurrent_requests: Mapped[int] = mapped_column(default=5)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

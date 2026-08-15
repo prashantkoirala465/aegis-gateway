@@ -1,8 +1,10 @@
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from aegis_gateway.core.config import get_settings
@@ -21,6 +23,21 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+@pytest.fixture
+async def redis_client() -> AsyncIterator[Redis]:
+    settings = get_settings()
+    client: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+def unique_key() -> str:
+    """A random suffix for Redis keys so tests don't collide on shared state without
+    needing a full FLUSHDB between them."""
+    return uuid.uuid4().hex
 
 
 @pytest.fixture

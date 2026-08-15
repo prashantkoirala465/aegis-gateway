@@ -3,9 +3,15 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
 from starlette.responses import Response, StreamingResponse
 
-from aegis_gateway.api.deps import get_provider_registry, get_redis
+from aegis_gateway.api.deps import (
+    get_budget_script,
+    get_provider_registry,
+    get_redis,
+    get_token_bucket_script,
+)
 from aegis_gateway.core.logging import get_logger
 from aegis_gateway.middleware.auth import get_current_tenant
 from aegis_gateway.providers.base import Provider
@@ -19,6 +25,12 @@ from aegis_gateway.services.idempotency import (
     release_lock,
     store_response,
     try_acquire_lock,
+)
+from aegis_gateway.services.rate_limiter import (
+    RateLimitExceeded,
+    acquire_concurrency_slot,
+    enforce_request_limits,
+    release_concurrency_slot,
 )
 from aegis_gateway.services.token_counter import count_prompt_tokens, count_text_tokens
 
@@ -45,18 +57,35 @@ def _completion_text(choices: list[dict[str, object]]) -> str:
     return "".join(parts)
 
 
+def _rate_limit_http_exception(exc: RateLimitExceeded) -> HTTPException:
+    headers = {"Retry-After": str(exc.retry_after_seconds)} if exc.retry_after_seconds else None
+    return HTTPException(
+        status_code=429,
+        detail=openai_error(str(exc), error_type="rate_limit_error", code=exc.code),
+        headers=headers,
+    )
+
+
 @router.post("/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
     tenant: TenantContext = Depends(get_current_tenant),
     redis: Redis = Depends(get_redis),
     registry: ProviderRegistry = Depends(get_provider_registry),
+    token_bucket_script: AsyncScript = Depends(get_token_bucket_script),
+    budget_script: AsyncScript = Depends(get_budget_script),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Response:
-    """OpenAI-compatible chat completions. Rate limiting and the PII/prompt-injection
-    security pipeline land in Phase 3/4 — this endpoint is the provider-proxying core
-    they'll wrap: auth, idempotency, routing, retries/circuit-breaker (in the provider
-    adapter), streaming, and approximate token counting.
+    """OpenAI-compatible chat completions. The PII/prompt-injection security pipeline
+    lands in Phase 4, wrapping this same core: auth, rate limiting, idempotency,
+    routing, retries/circuit-breaker (in the provider adapter), streaming, and
+    approximate token counting.
+
+    Enforcement order: idempotency replay/lock (cheapest — a pure cache hit skips
+    everything below) -> rate limits (RPM/TPM/budget, gates the expensive stuff) ->
+    concurrency slot (held for the full call/stream duration) -> the actual provider
+    call. See services/rate_limiter.py for why RPM/TPM/budget need one atomic Lua
+    round trip each but concurrency doesn't.
     """
     if idempotency_key and not body.stream:
         cached = await get_cached_response(redis, tenant.tenant_id, idempotency_key)
@@ -93,6 +122,36 @@ async def chat_completions(
 
     prompt_tokens = count_prompt_tokens(body.messages, body.model)
 
+    try:
+        await enforce_request_limits(
+            redis=redis,
+            token_bucket_script=token_bucket_script,
+            budget_script=budget_script,
+            tenant=tenant,
+            provider_name=provider.name,
+            model=body.model,
+            prompt_tokens=prompt_tokens,
+        )
+    except RateLimitExceeded as exc:
+        if idempotency_key:
+            await release_lock(redis, tenant.tenant_id, idempotency_key)
+        raise _rate_limit_http_exception(exc) from exc
+
+    if not await acquire_concurrency_slot(
+        redis, tenant_id=tenant.tenant_id, limit=tenant.max_concurrent_requests
+    ):
+        if idempotency_key:
+            await release_lock(redis, tenant.tenant_id, idempotency_key)
+        raise HTTPException(
+            status_code=429,
+            detail=openai_error(
+                f"Too many concurrent requests (limit {tenant.max_concurrent_requests}).",
+                error_type="rate_limit_error",
+                code="concurrency_limit_exceeded",
+            ),
+            headers={"Retry-After": "1"},
+        )
+
     if body.stream:
         return StreamingResponse(
             _stream_chat_completion(
@@ -112,6 +171,8 @@ async def chat_completions(
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)
         raise provider_error_to_http_exception(exc) from exc
+    finally:
+        await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
 
     if response.usage is None:
         completion_tokens = count_text_tokens(_completion_text(response.choices), body.model)
@@ -153,7 +214,9 @@ async def _stream_chat_completion(
     concurrent duplicate submission (the lock) — there is deliberately no replay
     cache here, since replaying a stored SSE stream byte-for-byte is materially more
     complex than replaying one cached JSON body and isn't worth it for this project's
-    scope. A retried streaming request just runs again.
+    scope. A retried streaming request just runs again. The concurrency slot acquired
+    by the caller is held for this entire generator's lifetime and released here,
+    since that's the actual duration the tenant occupies an upstream connection.
     """
     completion_parts: list[str] = []
     try:
@@ -179,5 +242,6 @@ async def _stream_chat_completion(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+        await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)

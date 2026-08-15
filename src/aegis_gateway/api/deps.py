@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import Request
 from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegis_gateway.core.config import Settings
@@ -27,3 +28,13 @@ def get_redis(request: Request) -> Redis:
 def get_provider_registry(request: Request) -> ProviderRegistry:
     registry: ProviderRegistry = request.app.state.providers
     return registry
+
+
+def get_token_bucket_script(request: Request) -> AsyncScript:
+    script: AsyncScript = request.app.state.token_bucket_script
+    return script
+
+
+def get_budget_script(request: Request) -> AsyncScript:
+    script: AsyncScript = request.app.state.budget_script
+    return script

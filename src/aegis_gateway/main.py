@@ -15,6 +15,7 @@ from aegis_gateway.db.redis import build_redis_client, build_redis_pool
 from aegis_gateway.db.session import build_engine, build_sessionmaker
 from aegis_gateway.middleware.request_id import CorrelationIdMiddleware
 from aegis_gateway.providers.registry import build_provider_registry
+from aegis_gateway.services.rate_limiter import register_rate_limit_scripts
 
 logger = get_logger(__name__)
 
@@ -45,12 +46,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     )
     providers = build_provider_registry(settings, client=provider_http_client)
+    token_bucket_script, budget_script = register_rate_limit_scripts(redis_client)
 
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis_client
     app.state.providers = providers
+    app.state.token_bucket_script = token_bucket_script
+    app.state.budget_script = budget_script
 
     logger.info("startup.complete", environment=settings.environment)
     try:
