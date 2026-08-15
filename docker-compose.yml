@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+      POSTGRES_DB: aegis_gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - aegis_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aegis_app:aegis_app@postgres:5432/aegis_gateway
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://aegis:aegis@postgres:5432/aegis_gateway
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # `exec` replaces the shell with uvicorn (PID 1) instead of running it as a shell
+    # child — without this, `docker stop`'s SIGTERM hits the shell, which doesn't
+    # forward it, so uvicorn never runs its graceful-shutdown path and gets SIGKILLed
+    # after the stop timeout instead.
+    command: >
+      sh -c "alembic upgrade head && exec uvicorn aegis_gateway.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  aegis_postgres_data:
