@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -9,12 +10,17 @@ from aegis_gateway.main import create_app
 
 
 @pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
+async def app() -> AsyncIterator[FastAPI]:
     app = create_app()
     async with app.router.lifespan_context(app):
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            yield ac
+        yield app
+
+
+@pytest.fixture
+async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
 
 
 @pytest.fixture

@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as default_http_exception_handler
 from starlette.responses import JSONResponse, Response
@@ -13,6 +14,7 @@ from aegis_gateway.core.logging import configure_logging, get_logger
 from aegis_gateway.db.redis import build_redis_client, build_redis_pool
 from aegis_gateway.db.session import build_engine, build_sessionmaker
 from aegis_gateway.middleware.request_id import CorrelationIdMiddleware
+from aegis_gateway.providers.registry import build_provider_registry
 
 logger = get_logger(__name__)
 
@@ -33,16 +35,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_pool = build_redis_pool(settings)
     redis_client = build_redis_client(redis_pool)
 
+    # Single shared client (and connection-pool limits) across every provider call in
+    # the process — bounds total upstream concurrency instead of letting each request
+    # open its own connection, which is what actually protects the process under load.
+    provider_http_client = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=settings.provider_max_connections,
+            max_keepalive_connections=settings.provider_max_keepalive_connections,
+        )
+    )
+    providers = build_provider_registry(settings, client=provider_http_client)
+
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis_client
+    app.state.providers = providers
 
     logger.info("startup.complete", environment=settings.environment)
     try:
         yield
     finally:
         logger.info("shutdown.begin")
+        await provider_http_client.aclose()
         await redis_client.aclose()
         await redis_pool.disconnect()
         await engine.dispose()

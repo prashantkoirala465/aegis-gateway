@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
 
+    provider_timeout_seconds: float = 30.0
+    provider_max_attempts: int = 3
+    provider_max_connections: int = 100
+    provider_max_keepalive_connections: int = 20
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_recovery_seconds: float = 30.0
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

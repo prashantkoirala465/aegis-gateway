@@ -5,8 +5,10 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 1 of 9 (tenants, API keys, Postgres RLS, auth). Provider proxying,
-rate limiting, and the security middleware pipeline are next.
+Status: Phase 2 of 9. Tenants, API keys, Postgres RLS, and auth are in, and
+`/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
+circuit breaker per provider, and idempotency keys. Rate limiting and the PII/prompt-
+injection pipeline are next.
 
 ## Architecture
 
@@ -66,6 +68,20 @@ The key is printed once and stored only as an HMAC digest afterward.
 curl -H "Authorization: Bearer agk_live_..." localhost:8000/v1/ping
 curl localhost:8000/healthz
 ```
+
+Proxy a real chat completion (routes to OpenAI for `gpt-*`/`o1`/`o3`/`o4` models,
+Ollama otherwise — set `OPENAI_API_KEY` in `.env` or run Ollama locally):
+
+```bash
+curl localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer agk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+Add `"stream": true` for SSE, or an `Idempotency-Key` header to make retries of the
+same request safe (a duplicate call with the same key replays the cached response
+instead of hitting the provider — and re-billing — twice).
 
 ## Local development
 
