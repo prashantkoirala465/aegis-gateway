@@ -5,9 +5,9 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 7 of 9. Tenants, API keys, Postgres RLS, and auth are in;
-`/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
-circuit breaker per provider, and idempotency keys; every request is gated by
+Status: Phase 8 of 9 (feature-complete). Tenants, API keys, Postgres RLS, and auth
+are in; `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries,
+a circuit breaker per provider, and idempotency keys; every request is gated by
 per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap;
 message content runs through Presidio-based PII redaction and heuristic +
 embedding-similarity prompt-injection detection before reaching a provider, with
@@ -15,9 +15,10 @@ every redaction, block, and auth failure written to a synchronous audit log;
 identical requests are served from an exact-match Redis cache instead of hitting the
 provider twice; every completed request writes an exact usage/cost record, rolled up
 hourly and daily by an arq worker that also scans for tenants crossing their budget;
-and the whole pipeline is now instrumented with Prometheus metrics (Grafana
-dashboard included) and hand-placed OpenTelemetry spans. Admin API and full docs are
-next.
+the whole pipeline is instrumented with Prometheus metrics (Grafana dashboard
+included) and hand-placed OpenTelemetry spans; and a JWT-authenticated admin API now
+covers tenant/key CRUD, per-tenant policy toggles, and usage/audit-log queries.
+Phase 9 (hardening + OSS polish) is next.
 
 ## Architecture
 
@@ -55,8 +56,8 @@ connects as a non-superuser role so the policies actually apply.
 Every tenant has per-request limits — `rate_limit_rpm`, `rate_limit_tpm`,
 `monthly_budget_usd`, `max_concurrent_requests` — enforced atomically in Redis via Lua
 scripts (a plain get-then-set is a race under concurrent requests) before a request
-reaches the provider. No admin API to change them yet (Phase 8); for now, set them on
-the `tenants` row directly.
+reaches the provider. Change them (and every other per-tenant policy toggle) via
+`PATCH /admin/tenants/{id}` — see Admin API below.
 
 Message content is redacted for PII (Presidio: spaCy NER + built-in regex recognizers)
 before it reaches a provider, unless a tenant has `pii_redaction_enabled=false`. Prompt-
@@ -102,6 +103,43 @@ console by default; set `OTEL_EXPORTER_OTLP_ENDPOINT` to ship them to a real
 backend (Jaeger, Tempo, Honeycomb, ...) instead — deliberately not bundled into
 docker-compose the way Prometheus/Grafana are, since a trace backend is a bigger
 infra commitment than a metrics scrape target.
+
+## Admin API
+
+JWT-authenticated, entirely separate from the tenant-facing HMAC API-key auth on
+`/v1/*` — no code path upgrades one into the other, so a leaked tenant key never
+grants admin access. There's deliberately no `/admin/register`; admin accounts are
+provisioned only via `scripts/seed.py`, run with owner DB credentials out-of-band, so
+this API surface can never self-provision admins.
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/admin/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "change-me-now"}' | jq -r .access_token)
+
+curl -s -X POST localhost:8000/admin/tenants -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "New Tenant", "monthly_budget_usd": "50.00"}'
+
+curl -s -X PATCH localhost:8000/admin/tenants/<id> -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"injection_detection_mode": "log", "rate_limit_rpm": 30}'
+
+curl -s -X POST localhost:8000/admin/tenants/<id>/api-keys -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "prod key"}'
+```
+
+Also: `GET /admin/tenants`, `GET/DELETE /admin/tenants/{id}/api-keys[/{key_id}]`,
+`GET /admin/tenants/{id}/usage/records|rollups`, `GET /admin/tenants/{id}/audit-log`,
+and `GET /admin/audit-log` (system-wide, includes `tenant_id: null` events like auth
+failures before a tenant could be resolved). Every mutating admin action writes its
+own `audit_log` row — tenant creation, policy changes, key issuance/revocation — so
+"who changed what" is answerable the same way "what did a tenant do" already was.
+Every admin tier is equally privileged for now; no RBAC beyond "has a valid admin
+JWT" — a documented simplification, not an oversight.
+
+Full request/response schemas are interactive at `/docs` (Swagger UI) once the
+gateway is running.
 
 ## Quickstart
 
