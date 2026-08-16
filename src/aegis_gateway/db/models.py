@@ -2,7 +2,16 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import ARRAY, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy import (
+    ARRAY,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -79,4 +88,65 @@ class AuditLog(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     correlation_id: Mapped[str | None] = mapped_column(String(64))
     detail: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UsageRecord(Base):
+    """RLS-protected like api_keys/audit_log. Written synchronously, in-request (see
+    services/usage.py), reusing whatever session the request already has open —
+    unlike audit_log this is genuinely one tenant's data, so it's written under that
+    tenant's normal RLS context (bypass=False), not a system-level bypass write.
+
+    This is the exact, durable record; the Redis budget guardrail (rate_limiter.py)
+    is a fast, approximate, pre-flight-only estimate that exists purely to stop a
+    request before it happens — it is not reconciled against this table.
+    """
+
+    __tablename__ = "usage_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    api_key_id: Mapped[str] = mapped_column(String(16))
+    provider: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(128))
+    prompt_tokens: Mapped[int]
+    completion_tokens: Mapped[int]
+    total_tokens: Mapped[int]
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    cache_hit: Mapped[bool] = mapped_column(default=False)
+    correlation_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UsageRollup(Base):
+    """Hourly/daily aggregates over usage_records, populated by arq cron jobs (see
+    workers/tasks.py) — written by a system job across every tenant, not on behalf
+    of one, so unlike usage_records this is written under RLS bypass. The unique
+    constraint on (tenant_id, period_type, period_start) is the upsert target: a
+    re-run of the same period updates the row instead of duplicating it, so a
+    retried or manually re-triggered rollup job is idempotent.
+    """
+
+    __tablename__ = "usage_rollups"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "period_type", "period_start", name="uq_usage_rollups_period"
+        ),
+        CheckConstraint("period_type IN ('hourly', 'daily')", name="ck_usage_rollups_period_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    period_type: Mapped[str] = mapped_column(String(8))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    request_count: Mapped[int]
+    cache_hit_count: Mapped[int]
+    prompt_tokens: Mapped[int]
+    completion_tokens: Mapped[int]
+    total_tokens: Mapped[int]
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

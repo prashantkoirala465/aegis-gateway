@@ -49,6 +49,7 @@ from aegis_gateway.services.rate_limiter import (
     release_concurrency_slot,
 )
 from aegis_gateway.services.token_counter import count_prompt_tokens, count_text_tokens
+from aegis_gateway.services.usage import record_usage
 
 router = APIRouter(prefix="/v1", tags=["proxy"])
 logger = get_logger(__name__)
@@ -271,10 +272,25 @@ async def chat_completions(
                     _stream_cached_completion(
                         cached_response,
                         tenant=tenant,
+                        provider=provider,
+                        session=session,
+                        correlation_id=correlation_id,
                         idempotency_key=idempotency_key,
                         redis=redis,
                     ),
                     media_type="text/event-stream",
+                )
+            if cached_response.usage is not None:
+                await record_usage(
+                    session,
+                    tenant_id=tenant.tenant_id,
+                    api_key_id=tenant.api_key_id,
+                    provider_name=provider.name,
+                    model=body.model,
+                    prompt_tokens=cached_response.usage.prompt_tokens,
+                    completion_tokens=cached_response.usage.completion_tokens,
+                    cache_hit=True,
+                    correlation_id=correlation_id,
                 )
             response_json = cached_response.model_dump_json()
             if idempotency_key:
@@ -292,11 +308,13 @@ async def chat_completions(
                 provider=provider,
                 body=body,
                 tenant=tenant,
+                session=session,
                 prompt_tokens=prompt_tokens,
                 idempotency_key=idempotency_key,
                 redis=redis,
                 cache_key=cache_key,
                 cache_ttl_seconds=settings.cache_ttl_seconds,
+                correlation_id=correlation_id,
             ),
             media_type="text/event-stream",
         )
@@ -332,6 +350,18 @@ async def chat_completions(
             redis, cache_key, response, ttl_seconds=settings.cache_ttl_seconds
         )
 
+    await record_usage(
+        session,
+        tenant_id=tenant.tenant_id,
+        api_key_id=tenant.api_key_id,
+        provider_name=provider.name,
+        model=body.model,
+        prompt_tokens=response.usage.prompt_tokens,
+        completion_tokens=response.usage.completion_tokens,
+        cache_hit=False,
+        correlation_id=correlation_id,
+    )
+
     response_json = response.model_dump_json()
     if idempotency_key:
         await store_response(redis, tenant.tenant_id, idempotency_key, response_json)
@@ -346,6 +376,9 @@ async def _stream_cached_completion(
     response: ChatCompletionResponse,
     *,
     tenant: TenantContext,
+    provider: Provider,
+    session: AsyncSession,
+    correlation_id: str | None,
     idempotency_key: str | None,
     redis: Redis,
 ) -> AsyncIterator[bytes]:
@@ -370,6 +403,18 @@ async def _stream_cached_completion(
         yield f"data: {json.dumps(chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
     finally:
+        if response.usage is not None:
+            await record_usage(
+                session,
+                tenant_id=tenant.tenant_id,
+                api_key_id=tenant.api_key_id,
+                provider_name=provider.name,
+                model=response.model,
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                cache_hit=True,
+                correlation_id=correlation_id,
+            )
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)
 
@@ -379,11 +424,13 @@ async def _stream_chat_completion(
     provider: Provider,
     body: ChatCompletionRequest,
     tenant: TenantContext,
+    session: AsyncSession,
     prompt_tokens: int,
     idempotency_key: str | None,
     redis: Redis,
     cache_key: str | None,
     cache_ttl_seconds: int,
+    correlation_id: str | None,
 ) -> AsyncIterator[bytes]:
     """SSE re-framing: upstream chunks are already OpenAI-shaped dicts (see
     Provider.stream_chat_completion), so this only has to re-serialize them, not
@@ -428,6 +475,18 @@ async def _stream_chat_completion(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+        if succeeded:
+            await record_usage(
+                session,
+                tenant_id=tenant.tenant_id,
+                api_key_id=tenant.api_key_id,
+                provider_name=provider.name,
+                model=body.model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_hit=False,
+                correlation_id=correlation_id,
+            )
         if succeeded and cache_key is not None and completion_text:
             cacheable = ChatCompletionResponse(
                 id=f"chatcmpl-cache-{uuid.uuid4().hex}",

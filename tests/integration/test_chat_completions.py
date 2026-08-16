@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegis_gateway.core.config import get_settings
 from aegis_gateway.core.security import generate_api_key, hash_api_key_secret
-from aegis_gateway.db.models import ApiKey, AuditLog, Tenant
+from aegis_gateway.db.models import ApiKey, AuditLog, Tenant, UsageRecord
 from aegis_gateway.providers.errors import UpstreamStatusError
 from aegis_gateway.providers.registry import ProviderRegistry
 from aegis_gateway.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
@@ -577,3 +577,89 @@ async def test_chat_completions_streaming_populates_cache_for_later_hit(
     lines = [line for line in body.decode().split("\n\n") if line.strip()]
     payloads = [json.loads(line.removeprefix("data: ")) for line in lines[:-1]]
     assert payloads[0]["choices"][0]["delta"]["content"] == "Hello"
+
+
+async def _usage_records(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[UsageRecord]:
+    result = await session.execute(select(UsageRecord).where(UsageRecord.tenant_id == tenant_id))
+    return list(result.scalars().all())
+
+
+async def test_chat_completions_records_usage_on_success(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, tenant_id = await _seed_tenant_and_key(owner_session)
+
+    response = await client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "record my usage"}]},
+    )
+    usage = response.json()["usage"]
+
+    records = await _usage_records(owner_session, tenant_id=tenant_id)
+    assert len(records) == 1
+    assert records[0].prompt_tokens == usage["prompt_tokens"]
+    assert records[0].completion_tokens == usage["completion_tokens"]
+    assert records[0].cache_hit is False
+    assert records[0].cost_usd > 0
+
+
+async def test_chat_completions_records_usage_on_cache_hit(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, tenant_id = await _seed_tenant_and_key(owner_session)
+    headers = {"Authorization": f"Bearer {full_key}"}
+    payload = {"model": "gpt-4o", "messages": [{"role": "user", "content": "cache and record"}]}
+
+    await client.post("/v1/chat/completions", headers=headers, json=payload)
+    await client.post("/v1/chat/completions", headers=headers, json=payload)
+
+    records = await _usage_records(owner_session, tenant_id=tenant_id)
+    assert len(records) == 2
+    assert sorted(r.cache_hit for r in records) == [False, True]
+
+
+async def test_chat_completions_records_usage_for_streaming(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, tenant_id = await _seed_tenant_and_key(owner_session)
+
+    async with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [{"role": "user", "content": "stream and record"}],
+        },
+    ) as response:
+        async for _ in response.aiter_bytes():
+            pass
+    assert response.status_code == 200
+
+    records = await _usage_records(owner_session, tenant_id=tenant_id)
+    assert len(records) == 1
+    assert records[0].completion_tokens > 0
+    assert records[0].cache_hit is False
+
+
+async def test_chat_completions_does_not_record_usage_on_provider_error(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    _install_fake_provider(app, FakeProvider(fail=UpstreamStatusError(500, "boom")))
+    full_key, tenant_id = await _seed_tenant_and_key(owner_session)
+
+    await client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert await _usage_records(owner_session, tenant_id=tenant_id) == []

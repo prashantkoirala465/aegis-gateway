@@ -5,15 +5,17 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 5 of 9. Tenants, API keys, Postgres RLS, and auth are in;
+Status: Phase 6 of 9. Tenants, API keys, Postgres RLS, and auth are in;
 `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
 circuit breaker per provider, and idempotency keys; every request is gated by
 per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap;
 message content runs through Presidio-based PII redaction and heuristic +
 embedding-similarity prompt-injection detection before reaching a provider, with
-every redaction, block, and auth failure written to a synchronous audit log; and
-identical requests are now served from an exact-match Redis cache instead of hitting
-the provider twice. Cost tracking and usage rollups are next.
+every redaction, block, and auth failure written to a synchronous audit log;
+identical requests are served from an exact-match Redis cache instead of hitting the
+provider twice; and every completed request now writes an exact usage/cost record,
+rolled up hourly and daily by an arq worker that also scans for tenants crossing
+their budget. Admin API and full docs are next.
 
 ## Architecture
 
@@ -72,6 +74,16 @@ same cached answer rather than generating a fresh one, which is the expected tra
 exact-match caching, not a bug. Semantic (embedding-similarity) caching is a documented
 roadmap item, not built — see below.
 
+Every completed request (streaming or not, cache hit or not) writes one `usage_records`
+row with exact prompt/completion tokens and cost — separate prompt/completion pricing
+per model, not a blended rate, since real providers price them differently. This is the
+durable, exact number; the Redis budget guardrail above is a fast, approximate,
+pre-flight-only estimate, never reconciled against it. A separate `worker` process (`arq`,
+chosen over Celery — see `docs/adr/0002-*`) aggregates `usage_records` into hourly/daily
+`usage_rollups` and scans month-to-date spend every 15 minutes, writing one
+`budget.threshold_reached` audit event (deduped via a Redis marker) the first time a
+tenant crosses 80% or 100% of budget.
+
 ## Quickstart
 
 ```bash
@@ -79,8 +91,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Starts Postgres, Redis, and the gateway. The gateway container runs `alembic upgrade
-head` (which also creates the restricted `aegis_app` runtime role) before starting.
+Starts Postgres, Redis, the gateway, and the background worker. The gateway container
+runs `alembic upgrade head` (which also creates the restricted `aegis_app` runtime role)
+before starting.
 
 Bootstrap a tenant, admin user, and API key:
 
