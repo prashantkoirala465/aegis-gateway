@@ -13,9 +13,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
-      - run: uv pip install --system ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
 
   typecheck:
     runs-on: ubuntu-latest
@@ -23,8 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
-      - run: uv pip install --system ".[dev]"
-      - run: mypy src
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - run: uv run mypy src
 
   test:
     runs-on: ubuntu-latest
@@ -54,10 +56,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
-      - run: uv pip install --system ".[dev]"
-      - run: python -m spacy download en_core_web_sm
-      - run: alembic upgrade head
-      - run: pytest --cov=aegis_gateway --cov-report=term-missing
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - run: uv run python -m spacy download en_core_web_sm
+      - run: uv run alembic upgrade head
+      - run: uv run pytest --cov=aegis_gateway --cov-report=term-missing
 
   security:
     runs-on: ubuntu-latest
@@ -71,8 +74,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
-      - run: uv pip install --system pip-audit
-      - run: pip-audit --strict -r <(uv pip compile pyproject.toml)
+      # uvx runs pip-audit in its own ephemeral, isolated env — no need for this
+      # job to manage a venv just to run one CLI tool once.
+      - run: uvx pip-audit --strict -r <(uv pip compile pyproject.toml)
 
   docker:
     runs-on: ubuntu-latest

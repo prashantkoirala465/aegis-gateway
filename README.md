@@ -1,5 +1,8 @@
 # Aegis Gateway
 
+[![CI](https://github.com/prashantkoirala465/aegis-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/prashantkoirala465/aegis-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A multi-tenant gateway that sits in front of LLM providers (OpenAI, Anthropic, local
 Ollama models) and exposes an OpenAI-compatible API surface: authentication, rate
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
