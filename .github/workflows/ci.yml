@@ -76,7 +76,19 @@ jobs:
       - run: uv python install 3.12
       # uvx runs pip-audit in its own ephemeral, isolated env — no need for this
       # job to manage a venv just to run one CLI tool once.
-      - run: uvx pip-audit --strict -r <(uv pip compile pyproject.toml)
+      #
+      # PYSEC-2026-3552/3553/3554 (cryptography 48.0.1): presidio-anonymizer pins
+      # cryptography>=48.0.1,<49.0.0 and no patched 48.x release exists upstream, so
+      # we can't take the fix without dropping Presidio. None of the three apply to
+      # this codebase's usage: they're in PKCS#7 EnvelopedData decryption and X.509
+      # chain building/verification, and this project does neither — cryptography is
+      # here only as presidio-anonymizer's transitive dependency. Revisit next time
+      # presidio-anonymizer bumps its cryptography ceiling.
+      - run: >-
+          uvx pip-audit --strict -r <(uv pip compile pyproject.toml)
+          --ignore-vuln PYSEC-2026-3552
+          --ignore-vuln PYSEC-2026-3553
+          --ignore-vuln PYSEC-2026-3554
 
   docker:
     runs-on: ubuntu-latest

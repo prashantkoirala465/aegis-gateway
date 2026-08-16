@@ -38,17 +38,23 @@ def test_password_hash_round_trip() -> None:
     assert not verify_password("wrong password", hashed)
 
 
+_TEST_SECRET = "jwt-secret-at-least-32-bytes-long-for-hs256"
+
+
 def test_admin_jwt_round_trip() -> None:
     token = create_admin_jwt(
-        subject="admin-id-123", secret="jwt-secret", algorithm="HS256", expire_minutes=5
+        subject="admin-id-123", secret=_TEST_SECRET, algorithm="HS256", expire_minutes=5
     )
-    payload = decode_admin_jwt(token, secret="jwt-secret", algorithm="HS256")
+    payload = decode_admin_jwt(token, secret=_TEST_SECRET, algorithm="HS256")
     assert payload is not None
     assert payload["sub"] == "admin-id-123"
 
 
 def test_admin_jwt_rejects_wrong_secret() -> None:
     token = create_admin_jwt(
-        subject="admin-id-123", secret="jwt-secret", algorithm="HS256", expire_minutes=5
+        subject="admin-id-123", secret=_TEST_SECRET, algorithm="HS256", expire_minutes=5
     )
-    assert decode_admin_jwt(token, secret="wrong-secret", algorithm="HS256") is None
+    assert (
+        decode_admin_jwt(token, secret="wrong-secret-also-32-bytes-long!", algorithm="HS256")
+        is None
+    )

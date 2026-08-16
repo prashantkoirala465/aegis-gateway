@@ -4,9 +4,9 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from jose import JWTError, jwt
 
 API_KEY_PREFIX = "agk_live_"
 KEY_ID_BYTES = 8  # 16 hex chars, indexable, not secret on its own
@@ -81,7 +81,7 @@ def create_admin_jwt(*, subject: str, secret: str, algorithm: str, expire_minute
 def decode_admin_jwt(token: str, *, secret: str, algorithm: str) -> dict[str, Any] | None:
     try:
         payload: dict[str, Any] = jwt.decode(token, secret, algorithms=[algorithm])
-    except JWTError:
+    except jwt.PyJWTError:
         return None
     if payload.get("scope") != "admin":
         return None
