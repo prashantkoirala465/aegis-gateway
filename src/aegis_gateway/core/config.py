@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_seconds: float = 30.0
 
+    cache_ttl_seconds: int = 300
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

@@ -65,6 +65,7 @@ async def _seed_tenant_and_key(
     injection_detection_enabled: bool = True,
     injection_detection_threshold: float = 0.75,
     injection_detection_mode: Literal["block", "log"] = "block",
+    cache_enabled: bool = True,
 ) -> tuple[str, uuid.UUID]:
     settings = get_settings()
     tenant = Tenant(
@@ -77,6 +78,7 @@ async def _seed_tenant_and_key(
         injection_detection_enabled=injection_detection_enabled,
         injection_detection_threshold=injection_detection_threshold,
         injection_detection_mode=injection_detection_mode,
+        cache_enabled=cache_enabled,
     )
     session.add(tenant)
     await session.flush()
@@ -481,3 +483,97 @@ async def test_auth_failure_writes_audit_event(
     event = result.scalar_one()
     assert event.detail["reason"] == "key_not_found"
     assert event.tenant_id is None
+
+
+async def test_chat_completions_second_identical_request_hits_cache(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, _ = await _seed_tenant_and_key(owner_session)
+    headers = {"Authorization": f"Bearer {full_key}"}
+    payload = {"model": "gpt-test", "messages": [{"role": "user", "content": "cache me please"}]}
+
+    first = await client.post("/v1/chat/completions", headers=headers, json=payload)
+    second = await client.post("/v1/chat/completions", headers=headers, json=payload)
+
+    assert first.status_code == 200
+    assert first.headers["x-cache"] == "miss"
+    assert second.status_code == 200
+    assert second.headers["x-cache"] == "hit"
+    assert first.json()["choices"] == second.json()["choices"]
+    assert provider.call_count == 1  # the second request never reached the provider
+
+
+async def test_chat_completions_cache_disabled_calls_provider_every_time(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, _ = await _seed_tenant_and_key(owner_session, cache_enabled=False)
+    headers = {"Authorization": f"Bearer {full_key}"}
+    payload = {"model": "gpt-test", "messages": [{"role": "user", "content": "never cache me"}]}
+
+    first = await client.post("/v1/chat/completions", headers=headers, json=payload)
+    second = await client.post("/v1/chat/completions", headers=headers, json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.headers["x-cache"] == "miss"  # cache never consulted — always a "miss"
+    assert provider.call_count == 2
+
+
+async def test_chat_completions_cache_is_tenant_scoped(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    key_a, _ = await _seed_tenant_and_key(owner_session)
+    key_b, _ = await _seed_tenant_and_key(owner_session)
+    payload = {"model": "gpt-test", "messages": [{"role": "user", "content": "shared prompt text"}]}
+
+    await client.post(
+        "/v1/chat/completions", headers={"Authorization": f"Bearer {key_a}"}, json=payload
+    )
+    response_b = await client.post(
+        "/v1/chat/completions", headers={"Authorization": f"Bearer {key_b}"}, json=payload
+    )
+
+    assert response_b.status_code == 200
+    assert response_b.headers["x-cache"] == "miss"  # tenant B never sees tenant A's cache entry
+    assert provider.call_count == 2
+
+
+async def test_chat_completions_streaming_populates_cache_for_later_hit(
+    app: FastAPI, client: AsyncClient, owner_session: AsyncSession
+) -> None:
+    provider = FakeProvider()
+    _install_fake_provider(app, provider)
+    full_key, _ = await _seed_tenant_and_key(owner_session)
+    headers = {"Authorization": f"Bearer {full_key}"}
+    payload = {
+        "model": "gpt-test",
+        "stream": True,
+        "messages": [{"role": "user", "content": "stream then cache"}],
+    }
+
+    async with client.stream(
+        "POST", "/v1/chat/completions", headers=headers, json=payload
+    ) as first:
+        assert first.status_code == 200
+        async for _ in first.aiter_bytes():
+            pass
+    assert provider.call_count == 1
+
+    async with client.stream(
+        "POST", "/v1/chat/completions", headers=headers, json=payload
+    ) as second:
+        assert second.status_code == 200
+        body = b""
+        async for chunk in second.aiter_bytes():
+            body += chunk
+
+    assert provider.call_count == 1  # second stream served entirely from cache
+    lines = [line for line in body.decode().split("\n\n") if line.strip()]
+    payloads = [json.loads(line.removeprefix("data: ")) for line in lines[:-1]]
+    assert payloads[0]["choices"][0]["delta"]["content"] == "Hello"

@@ -5,14 +5,15 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 4 of 9. Tenants, API keys, Postgres RLS, and auth are in;
+Status: Phase 5 of 9. Tenants, API keys, Postgres RLS, and auth are in;
 `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
 circuit breaker per provider, and idempotency keys; every request is gated by
 per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap;
-and message content is now run through Presidio-based PII redaction and heuristic +
-embedding-similarity prompt-injection detection before it reaches a provider, with
-every redaction, block, and auth failure written to a synchronous audit log. Cost
-tracking and usage rollups are next.
+message content runs through Presidio-based PII redaction and heuristic +
+embedding-similarity prompt-injection detection before reaching a provider, with
+every redaction, block, and auth failure written to a synchronous audit log; and
+identical requests are now served from an exact-match Redis cache instead of hitting
+the provider twice. Cost tracking and usage rollups are next.
 
 ## Architecture
 
@@ -62,6 +63,14 @@ API key configured. Each tenant picks `injection_detection_mode`: `block` (403) 
 (allowed through, recorded). Every redaction, injection verdict, and auth failure writes
 a synchronous row to `audit_log` — never queued, and never containing raw prompt/PII
 content, only categories and scores.
+
+Identical requests (same tenant, model, messages, and generation params — hashed after
+redaction, so it's caching what actually gets sent) are served from Redis instead of
+hitting the provider again, TTL-bound and skippable per tenant via `cache_enabled`. This
+is exact-match only: a repeated non-deterministic request (temperature > 0) replays the
+same cached answer rather than generating a fresh one, which is the expected tradeoff of
+exact-match caching, not a bug. Semantic (embedding-similarity) caching is a documented
+roadmap item, not built — see below.
 
 ## Quickstart
 

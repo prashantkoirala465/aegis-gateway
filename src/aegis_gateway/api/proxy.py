@@ -1,4 +1,6 @@
 import json
+import time
+import uuid
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -14,8 +16,10 @@ from aegis_gateway.api.deps import (
     get_pii_redactor,
     get_provider_registry,
     get_redis,
+    get_settings_dep,
     get_token_bucket_script,
 )
+from aegis_gateway.core.config import Settings
 from aegis_gateway.core.logging import get_logger
 from aegis_gateway.detectors.pii import PiiRedactor, redact_messages
 from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
@@ -24,9 +28,14 @@ from aegis_gateway.providers.base import Provider
 from aegis_gateway.providers.errors import ProviderError, provider_error_to_http_exception
 from aegis_gateway.providers.registry import ProviderRegistry, UnknownProviderError
 from aegis_gateway.schemas.auth import TenantContext
-from aegis_gateway.schemas.chat import ChatCompletionRequest, Usage
+from aegis_gateway.schemas.chat import ChatCompletionRequest, ChatCompletionResponse, Usage
 from aegis_gateway.schemas.errors import openai_error
 from aegis_gateway.services.audit import write_audit_event
+from aegis_gateway.services.cache import (
+    compute_cache_key,
+    get_cached_completion,
+    store_cached_completion,
+)
 from aegis_gateway.services.idempotency import (
     get_cached_response,
     release_lock,
@@ -85,9 +94,10 @@ async def _run_security_pipeline(
     """Runs after rate limiting/concurrency (see chat_completions) so an obviously
     abusive request rate can't burn PII/injection-detection compute — that ordering
     is deliberate, see docs/THREAT_MODEL.md. Returns a copy of `body` with PII-
-    redacted message content (what actually gets sent upstream); raises
-    HTTPException(403) if prompt injection is flagged and the tenant's mode is
-    "block". A "log" verdict is recorded but the request proceeds.
+    redacted message content (what actually gets sent upstream, and cached — see
+    services/cache.py); raises HTTPException(403) if prompt injection is flagged and
+    the tenant's mode is "block". A "log" verdict is recorded but the request
+    proceeds.
     """
     messages = body.messages
 
@@ -142,6 +152,7 @@ async def chat_completions(
     session: AsyncSession = Depends(get_db_session),
     redis: Redis = Depends(get_redis),
     registry: ProviderRegistry = Depends(get_provider_registry),
+    settings: Settings = Depends(get_settings_dep),
     token_bucket_script: AsyncScript = Depends(get_token_bucket_script),
     budget_script: AsyncScript = Depends(get_budget_script),
     pii_redactor: PiiRedactor = Depends(get_pii_redactor),
@@ -154,7 +165,13 @@ async def chat_completions(
     everything below) -> rate limits (RPM/TPM/budget, gates the expensive stuff) ->
     concurrency slot (held for the full call/stream duration) -> PII redaction +
     prompt-injection detection (CPU/latency-costly, deliberately gated behind rate
-    limiting) -> the actual provider call, using the redacted message content.
+    limiting) -> response cache lookup (on the redacted body — what would actually be
+    sent) -> the actual provider call.
+
+    Budget is reserved before the cache lookup, so a cache hit still counts against
+    monthly budget even though no real provider cost was incurred — conservative
+    (never undercounts), not exact; Phase 6 reconciles against real provider-reported
+    usage.
     """
     correlation_id = getattr(request.state, "correlation_id", None)
 
@@ -238,6 +255,37 @@ async def chat_completions(
             await release_lock(redis, tenant.tenant_id, idempotency_key)
         raise
 
+    cache_key = compute_cache_key(tenant.tenant_id, body) if tenant.cache_enabled else None
+    if cache_key is not None:
+        cached_response = await get_cached_completion(redis, cache_key)
+        if cached_response is not None:
+            await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
+            logger.info(
+                "chat.completion.cache_hit",
+                tenant_id=str(tenant.tenant_id),
+                provider=provider.name,
+                model=body.model,
+            )
+            if body.stream:
+                return StreamingResponse(
+                    _stream_cached_completion(
+                        cached_response,
+                        tenant=tenant,
+                        idempotency_key=idempotency_key,
+                        redis=redis,
+                    ),
+                    media_type="text/event-stream",
+                )
+            response_json = cached_response.model_dump_json()
+            if idempotency_key:
+                await store_response(redis, tenant.tenant_id, idempotency_key, response_json)
+                await release_lock(redis, tenant.tenant_id, idempotency_key)
+            return Response(
+                content=response_json,
+                media_type="application/json",
+                headers={"X-Cache": "hit"},
+            )
+
     if body.stream:
         return StreamingResponse(
             _stream_chat_completion(
@@ -247,6 +295,8 @@ async def chat_completions(
                 prompt_tokens=prompt_tokens,
                 idempotency_key=idempotency_key,
                 redis=redis,
+                cache_key=cache_key,
+                cache_ttl_seconds=settings.cache_ttl_seconds,
             ),
             media_type="text/event-stream",
         )
@@ -277,12 +327,51 @@ async def chat_completions(
         completion_tokens=response.usage.completion_tokens,
     )
 
+    if cache_key is not None:
+        await store_cached_completion(
+            redis, cache_key, response, ttl_seconds=settings.cache_ttl_seconds
+        )
+
     response_json = response.model_dump_json()
     if idempotency_key:
         await store_response(redis, tenant.tenant_id, idempotency_key, response_json)
         await release_lock(redis, tenant.tenant_id, idempotency_key)
 
-    return Response(content=response_json, media_type="application/json")
+    return Response(
+        content=response_json, media_type="application/json", headers={"X-Cache": "miss"}
+    )
+
+
+async def _stream_cached_completion(
+    response: ChatCompletionResponse,
+    *,
+    tenant: TenantContext,
+    idempotency_key: str | None,
+    redis: Redis,
+) -> AsyncIterator[bytes]:
+    """A cache hit still has to satisfy a streaming client. Rather than storing and
+    replaying the original SSE frame sequence (materially more complex, and the same
+    tradeoff idempotency's streaming path already makes — see _stream_chat_completion),
+    this synthesizes a single chunk carrying the full cached content."""
+    chunk = {
+        "id": response.id,
+        "object": "chat.completion.chunk",
+        "created": response.created,
+        "model": response.model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": _completion_text(response.choices)},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    try:
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+    finally:
+        if idempotency_key:
+            await release_lock(redis, tenant.tenant_id, idempotency_key)
 
 
 async def _stream_chat_completion(
@@ -293,6 +382,8 @@ async def _stream_chat_completion(
     prompt_tokens: int,
     idempotency_key: str | None,
     redis: Redis,
+    cache_key: str | None,
+    cache_ttl_seconds: int,
 ) -> AsyncIterator[bytes]:
     """SSE re-framing: upstream chunks are already OpenAI-shaped dicts (see
     Provider.stream_chat_completion), so this only has to re-serialize them, not
@@ -303,8 +394,15 @@ async def _stream_chat_completion(
     scope. A retried streaming request just runs again. The concurrency slot acquired
     by the caller is held for this entire generator's lifetime and released here,
     since that's the actual duration the tenant occupies an upstream connection.
+
+    On a successful stream, the accumulated content is stored under `cache_key` (if
+    caching is enabled) as an ordinary non-streaming-shaped response — a future
+    streaming *or* non-streaming request with the same cache key gets it back via
+    _stream_cached_completion or the plain JSON path respectively. Nothing is cached
+    if the stream errors partway through.
     """
     completion_parts: list[str] = []
+    succeeded = True
     try:
         async for chunk in provider.stream_chat_completion(body):
             for choice in chunk.get("choices") or []:
@@ -316,10 +414,12 @@ async def _stream_chat_completion(
             yield f"data: {json.dumps(chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
     except ProviderError as exc:
+        succeeded = False
         error_payload = openai_error(str(exc), error_type="upstream_error", code="provider_error")
         yield f"data: {json.dumps(error_payload)}\n\n".encode()
     finally:
-        completion_tokens = count_text_tokens("".join(completion_parts), body.model)
+        completion_text = "".join(completion_parts)
+        completion_tokens = count_text_tokens(completion_text, body.model)
         logger.info(
             "chat.completion.streamed",
             tenant_id=str(tenant.tenant_id),
@@ -328,6 +428,27 @@ async def _stream_chat_completion(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+        if succeeded and cache_key is not None and completion_text:
+            cacheable = ChatCompletionResponse(
+                id=f"chatcmpl-cache-{uuid.uuid4().hex}",
+                created=int(time.time()),
+                model=body.model,
+                choices=[
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": completion_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
+            await store_cached_completion(
+                redis, cache_key, cacheable, ttl_seconds=cache_ttl_seconds
+            )
         await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)

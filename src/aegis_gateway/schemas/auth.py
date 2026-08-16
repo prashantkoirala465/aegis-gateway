@@ -22,6 +22,7 @@ class TenantContext(BaseModel):
     injection_detection_enabled: bool
     injection_detection_threshold: float
     injection_detection_mode: Literal["block", "log"]
+    cache_enabled: bool
 
 
 class AdminLoginRequest(BaseModel):

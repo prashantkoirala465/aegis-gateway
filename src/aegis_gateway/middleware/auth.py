@@ -116,4 +116,5 @@ async def get_current_tenant(
         injection_detection_enabled=tenant.injection_detection_enabled,
         injection_detection_threshold=tenant.injection_detection_threshold,
         injection_detection_mode=tenant.injection_detection_mode,
+        cache_enabled=tenant.cache_enabled,
     )
