@@ -38,7 +38,7 @@ def test_password_hash_round_trip() -> None:
     assert not verify_password("wrong password", hashed)
 
 
-_TEST_SECRET = "jwt-secret-at-least-32-bytes-long-for-hs256"
+_TEST_SECRET = "jwt-secret-at-least-32-bytes-long-for-hs256"  # gitleaks:allow
 
 
 def test_admin_jwt_round_trip() -> None:
