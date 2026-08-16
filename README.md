@@ -5,9 +5,10 @@ Ollama models) and exposes an OpenAI-compatible API surface: authentication, rat
 limiting, prompt-injection and PII filtering, caching, cost accounting, and audit
 logging. Same category as Portkey, LiteLLM proxy, or Cloudflare AI Gateway.
 
-Status: Phase 8 of 9 (feature-complete). Tenants, API keys, Postgres RLS, and auth
-are in; `/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries,
-a circuit breaker per provider, and idempotency keys; every request is gated by
+Status: feature-complete (all 9 build phases). Tenants, API keys, and Postgres RLS
+back a tenant-facing HMAC API-key auth and a separate JWT-authenticated admin API;
+`/v1/chat/completions` proxies to OpenAI and Ollama with streaming, retries, a
+circuit breaker per provider, and idempotency keys; every request is gated by
 per-tenant RPM/TPM token buckets, a monthly budget guardrail, and a concurrency cap;
 message content runs through Presidio-based PII redaction and heuristic +
 embedding-similarity prompt-injection detection before reaching a provider, with
@@ -16,9 +17,10 @@ identical requests are served from an exact-match Redis cache instead of hitting
 provider twice; every completed request writes an exact usage/cost record, rolled up
 hourly and daily by an arq worker that also scans for tenants crossing their budget;
 the whole pipeline is instrumented with Prometheus metrics (Grafana dashboard
-included) and hand-placed OpenTelemetry spans; and a JWT-authenticated admin API now
-covers tenant/key CRUD, per-tenant policy toggles, and usage/audit-log queries.
-Phase 9 (hardening + OSS polish) is next.
+included) and hand-placed OpenTelemetry spans; and the admin API covers tenant/key
+CRUD, per-tenant policy toggles, and usage/audit-log queries. See Load testing below
+for real numbers under concurrency and Migrations for a verified upgrade/downgrade
+round trip.
 
 ## Architecture
 
@@ -196,6 +198,48 @@ uvicorn aegis_gateway.main:app --reload
 
 Tests: `pytest`. Lint/typecheck: `ruff check . && mypy src`.
 
+## Migrations
+
+`alembic downgrade base && alembic upgrade head` is verified to round-trip cleanly —
+every `downgrade()` actually drops what its `upgrade()` created, including the
+`aegis_app` role and its RLS policies, not just the tables. This gets exercised in
+CI-adjacent local verification, not left as an untested `pass` stub.
+
+## Load testing
+
+Two `locust` scenarios in `tests/load/locustfile.py`, run headless against a live
+`docker compose` stack — not part of `pytest`, and not dependent on a real upstream
+provider succeeding (every request is expected to end in 429/502/503 without a real
+OpenAI key or local Ollama; that's fine, both scenarios measure the gateway's own
+overhead and concurrency-safety, not completion quality):
+
+```bash
+LOAD_TEST_RATE_LIMITED_KEY=agk_live_... uv run locust -f tests/load/locustfile.py \
+  --headless --host http://localhost:8000 -u 20 -r 20 -t 30s RateLimitGuardrailUser
+
+LOAD_TEST_STREAMING_KEY=agk_live_... uv run locust -f tests/load/locustfile.py \
+  --headless --host http://localhost:8000 -u 20 -r 20 -t 30s SecurityPipelineUser
+```
+
+Real results from one run (20 concurrent users, 30s, this machine — not
+representative of any particular production hardware):
+
+- **Rate limiter under concurrency** (30 RPM cap): 3,169 requests fired, 3,130
+  rejected with 429, only 39 admitted through to a provider attempt (23 real
+  connection errors + 16 fast-failed once the circuit breaker opened) — within the
+  token bucket's expected ceiling (capacity + refill over the window), confirming
+  the atomic Lua script holds an exact cap with no over-admission race under real
+  concurrent load. Median latency 76ms; a handful of outliers up to 9.6s, fully
+  explained by retry-with-backoff on repeated connection failures (up to 3 attempts,
+  each waiting up to ~4s of jittered backoff) — expected behavior, not a defect,
+  and visible in production via the `aegis_provider_call_duration_seconds` histogram.
+- **PII/injection pipeline under concurrent streaming load**: 1,657 requests, each
+  running real Presidio PII redaction + prompt-injection heuristics, sustained at
+  55–63 req/s with a steady median latency (~280ms) and no throughput collapse —
+  evidence that offloading Presidio's synchronous analyzer via `asyncio.to_thread`
+  (see `detectors/pii.py`) actually keeps the event loop responsive under load
+  rather than serializing every request behind it.
+
 ## Roadmap
 
 Not implemented yet, on purpose: semantic caching (exact-match caching is the real
@@ -204,6 +248,11 @@ classifier (shipping a heuristic + embedding-similarity detector instead), a gen
 policy engine (fixed per-tenant toggles instead of a rules DSL), and anything requiring
 HA/multi-region, admin SSO, automated key rotation, or GDPR erasure — out of scope for
 a single-instance deployment.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, what CI checks, and the
+patterns (RLS policies, test structure) new code is expected to follow.
 
 ## License
 
