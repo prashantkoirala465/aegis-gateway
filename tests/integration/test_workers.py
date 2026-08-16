@@ -18,6 +18,17 @@ async def _seed_tenant(owner_session: AsyncSession, **overrides: object) -> Tena
     return tenant
 
 
+def _unique_period_start(tenant_id: uuid.UUID) -> datetime:
+    """A rollup window derived from the tenant's own (random) UUID rather than a
+    fixed literal date. Fixed dates collide across test runs against the persistent
+    local Postgres volume (docker compose down without -v keeps data between
+    sessions) — a *different* tenant's leftover usage_records from a prior run can
+    land in the same hardcoded window and inflate `_rollup_period`'s tenant count.
+    Tying the window to this test's own tenant_id makes every run's window unique."""
+    offset_minutes = tenant_id.int % (365 * 24 * 60)
+    return datetime(2020, 1, 1, tzinfo=UTC) + timedelta(minutes=offset_minutes)
+
+
 def _usage_record(
     *, tenant_id: uuid.UUID, created_at: datetime, cost_usd: Decimal, cache_hit: bool = False
 ) -> UsageRecord:
@@ -39,7 +50,7 @@ async def test_rollup_period_aggregates_usage_records(
     app: FastAPI, owner_session: AsyncSession
 ) -> None:
     tenant = await _seed_tenant(owner_session)
-    period_start = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    period_start = _unique_period_start(tenant.id)
     period_end = period_start + timedelta(hours=1)
 
     owner_session.add_all(
@@ -82,7 +93,7 @@ async def test_rollup_period_upsert_is_idempotent_on_rerun(
     app: FastAPI, owner_session: AsyncSession
 ) -> None:
     tenant = await _seed_tenant(owner_session)
-    period_start = datetime(2026, 2, 1, 8, tzinfo=UTC)
+    period_start = _unique_period_start(tenant.id)
     period_end = period_start + timedelta(hours=1)
 
     owner_session.add(
@@ -115,7 +126,7 @@ async def test_rollup_period_excludes_records_outside_window(
     app: FastAPI, owner_session: AsyncSession
 ) -> None:
     tenant = await _seed_tenant(owner_session)
-    period_start = datetime(2026, 3, 1, 10, tzinfo=UTC)
+    period_start = _unique_period_start(tenant.id)
     period_end = period_start + timedelta(hours=1)
 
     owner_session.add_all(
@@ -166,7 +177,7 @@ async def test_budget_threshold_scan_writes_audit_event_once(
         )
     )
     events = result.scalars().all()
-    assert len(events) == 1
+    assert len(events) == 1, [(e.detail, e.created_at, e.correlation_id) for e in events]
     assert events[0].detail["threshold"] == 0.8
 
 

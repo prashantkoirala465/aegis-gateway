@@ -1,0 +1,115 @@
+{
+  "title": "Aegis Gateway",
+  "uid": "aegis-gateway",
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate by status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "sum(rate(aegis_http_requests_total[5m])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Chat completions p95 latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(aegis_http_request_duration_seconds_bucket{route=\"/v1/chat/completions\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Cache hit ratio",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "sum(rate(aegis_cache_lookups_total{result=\"hit\"}[15m])) / sum(rate(aegis_cache_lookups_total[15m]))",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Circuit breaker state (0=closed, 1=half-open, 2=open)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "aegis_provider_circuit_breaker_state",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "Provider cost per hour",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "sum(rate(aegis_usage_cost_usd_total[5m])) by (provider) * 3600",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Rate/budget/concurrency rejections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "aegis-prometheus" },
+          "expr": "sum(rate(aegis_rate_limit_rejections_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    }
+  ]
+}

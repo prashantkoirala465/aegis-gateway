@@ -47,6 +47,12 @@ class Settings(BaseSettings):
 
     cache_ttl_seconds: int = 300
 
+    otel_exporter_otlp_endpoint: str = Field(
+        default="",
+        description="OTLP HTTP endpoint for trace export (e.g. a local Jaeger/Tempo "
+        "collector). Empty (default) exports spans to the console instead.",
+    )
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

@@ -5,17 +5,21 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as default_http_exception_handler
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette.responses import JSONResponse, Response
 
 from aegis_gateway.api.admin import router as admin_router
 from aegis_gateway.api.health import router as health_router
+from aegis_gateway.api.metrics import router as metrics_router
 from aegis_gateway.api.proxy import router as proxy_router
 from aegis_gateway.core.config import get_settings
 from aegis_gateway.core.logging import configure_logging, get_logger
+from aegis_gateway.core.tracing import configure_tracing
 from aegis_gateway.db.redis import build_redis_client, build_redis_pool
 from aegis_gateway.db.session import build_engine, build_sessionmaker
 from aegis_gateway.detectors.pii import PiiRedactor
 from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
+from aegis_gateway.middleware.metrics import PrometheusMiddleware
 from aegis_gateway.middleware.request_id import CorrelationIdMiddleware
 from aegis_gateway.providers.registry import build_provider_registry
 from aegis_gateway.services.rate_limiter import register_rate_limit_scripts
@@ -74,6 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         logger.info("shutdown.begin")
+        app.state.tracer_provider.shutdown()  # flushes any batched spans before exit
         await provider_http_client.aclose()
         await redis_client.aclose()
         await redis_pool.disconnect()
@@ -82,6 +87,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+    tracer_provider = configure_tracing(settings)
+
     app = FastAPI(
         title="Aegis Gateway",
         description=(
@@ -91,11 +99,17 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.state.tracer_provider = tracer_provider
+    # Middleware added later wraps those added earlier, so Prometheus (added second)
+    # sits outermost and times the *entire* request, correlation-ID setup included.
     app.add_middleware(CorrelationIdMiddleware)
+    app.add_middleware(PrometheusMiddleware)
     app.include_router(health_router)
+    app.include_router(metrics_router)
     app.include_router(admin_router)
     app.include_router(proxy_router)
     app.add_exception_handler(HTTPException, openai_style_http_exception_handler)
+    FastAPIInstrumentor.instrument_app(app)
     return app
 
 

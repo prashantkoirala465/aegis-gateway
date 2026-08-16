@@ -4,6 +4,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,14 @@ from aegis_gateway.api.deps import (
 )
 from aegis_gateway.core.config import Settings
 from aegis_gateway.core.logging import get_logger
+from aegis_gateway.core.metrics import (
+    cache_lookups_total,
+    chat_completions_total,
+    injection_detections_total,
+    pii_redactions_total,
+    provider_call_duration_seconds,
+    rate_limit_rejections_total,
+)
 from aegis_gateway.detectors.pii import PiiRedactor, redact_messages
 from aegis_gateway.detectors.prompt_injection import PromptInjectionDetector
 from aegis_gateway.middleware.auth import get_current_tenant
@@ -53,6 +62,7 @@ from aegis_gateway.services.usage import record_usage
 
 router = APIRouter(prefix="/v1", tags=["proxy"])
 logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 @router.get("/ping")
@@ -105,6 +115,7 @@ async def _run_security_pipeline(
     if tenant.pii_redaction_enabled:
         messages, entity_types = await redact_messages(pii_redactor, messages)
         if entity_types:
+            pii_redactions_total.inc()
             await write_audit_event(
                 session,
                 tenant_id=tenant.tenant_id,
@@ -120,6 +131,7 @@ async def _run_security_pipeline(
         verdict = await injection_detector.detect(user_text)
         if verdict.score >= tenant.injection_detection_threshold:
             blocked = tenant.injection_detection_mode == "block"
+            injection_detections_total.labels(mode=tenant.injection_detection_mode).inc()
             await write_audit_event(
                 session,
                 tenant_id=tenant.tenant_id,
@@ -211,54 +223,67 @@ async def chat_completions(
 
     prompt_tokens = count_prompt_tokens(body.messages, body.model)
 
-    try:
-        await enforce_request_limits(
-            redis=redis,
-            token_bucket_script=token_bucket_script,
-            budget_script=budget_script,
-            tenant=tenant,
-            provider_name=provider.name,
-            model=body.model,
-            prompt_tokens=prompt_tokens,
-        )
-    except RateLimitExceeded as exc:
-        if idempotency_key:
-            await release_lock(redis, tenant.tenant_id, idempotency_key)
-        raise _rate_limit_http_exception(exc) from exc
+    with tracer.start_as_current_span("rate_limit"):
+        try:
+            await enforce_request_limits(
+                redis=redis,
+                token_bucket_script=token_bucket_script,
+                budget_script=budget_script,
+                tenant=tenant,
+                provider_name=provider.name,
+                model=body.model,
+                prompt_tokens=prompt_tokens,
+            )
+        except RateLimitExceeded as exc:
+            rate_limit_rejections_total.labels(reason=exc.code).inc()
+            chat_completions_total.labels(provider=provider.name, outcome="rate_limited").inc()
+            if idempotency_key:
+                await release_lock(redis, tenant.tenant_id, idempotency_key)
+            raise _rate_limit_http_exception(exc) from exc
 
-    if not await acquire_concurrency_slot(
-        redis, tenant_id=tenant.tenant_id, limit=tenant.max_concurrent_requests
-    ):
-        if idempotency_key:
-            await release_lock(redis, tenant.tenant_id, idempotency_key)
-        raise HTTPException(
-            status_code=429,
-            detail=openai_error(
-                f"Too many concurrent requests (limit {tenant.max_concurrent_requests}).",
-                error_type="rate_limit_error",
-                code="concurrency_limit_exceeded",
-            ),
-            headers={"Retry-After": "1"},
-        )
+        if not await acquire_concurrency_slot(
+            redis, tenant_id=tenant.tenant_id, limit=tenant.max_concurrent_requests
+        ):
+            rate_limit_rejections_total.labels(reason="concurrency_limit_exceeded").inc()
+            chat_completions_total.labels(provider=provider.name, outcome="rate_limited").inc()
+            if idempotency_key:
+                await release_lock(redis, tenant.tenant_id, idempotency_key)
+            raise HTTPException(
+                status_code=429,
+                detail=openai_error(
+                    f"Too many concurrent requests (limit {tenant.max_concurrent_requests}).",
+                    error_type="rate_limit_error",
+                    code="concurrency_limit_exceeded",
+                ),
+                headers={"Retry-After": "1"},
+            )
 
     try:
-        body = await _run_security_pipeline(
-            body=body,
-            tenant=tenant,
-            session=session,
-            correlation_id=correlation_id,
-            pii_redactor=pii_redactor,
-            injection_detector=injection_detector,
-        )
+        with tracer.start_as_current_span("security_pipeline"):
+            body = await _run_security_pipeline(
+                body=body,
+                tenant=tenant,
+                session=session,
+                correlation_id=correlation_id,
+                pii_redactor=pii_redactor,
+                injection_detector=injection_detector,
+            )
     except HTTPException:
+        chat_completions_total.labels(provider=provider.name, outcome="blocked").inc()
         await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)
         raise
 
-    cache_key = compute_cache_key(tenant.tenant_id, body) if tenant.cache_enabled else None
+    with tracer.start_as_current_span("cache_lookup") as cache_span:
+        cache_key = compute_cache_key(tenant.tenant_id, body) if tenant.cache_enabled else None
+        cached_response = (
+            await get_cached_completion(redis, cache_key) if cache_key is not None else None
+        )
+        cache_span.set_attribute("cache.hit", cached_response is not None)
+
     if cache_key is not None:
-        cached_response = await get_cached_completion(redis, cache_key)
+        cache_lookups_total.labels(result="hit" if cached_response is not None else "miss").inc()
         if cached_response is not None:
             await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
             logger.info(
@@ -319,14 +344,23 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
+    provider_call_start = time.monotonic()
     try:
-        response = await provider.chat_completion(body)
+        with tracer.start_as_current_span("provider_call"):
+            response = await provider.chat_completion(body)
     except ProviderError as exc:
+        provider_call_duration_seconds.labels(provider=provider.name, outcome="error").observe(
+            time.monotonic() - provider_call_start
+        )
+        chat_completions_total.labels(provider=provider.name, outcome="error").inc()
         if idempotency_key:
             await release_lock(redis, tenant.tenant_id, idempotency_key)
         raise provider_error_to_http_exception(exc) from exc
     finally:
         await release_concurrency_slot(redis, tenant_id=tenant.tenant_id)
+    provider_call_duration_seconds.labels(provider=provider.name, outcome="success").observe(
+        time.monotonic() - provider_call_start
+    )
 
     if response.usage is None:
         completion_tokens = count_text_tokens(_completion_text(response.choices), body.model)
@@ -450,21 +484,30 @@ async def _stream_chat_completion(
     """
     completion_parts: list[str] = []
     succeeded = True
+    provider_call_start = time.monotonic()
     try:
-        async for chunk in provider.stream_chat_completion(body):
-            for choice in chunk.get("choices") or []:
-                delta = choice.get("delta") if isinstance(choice, dict) else None
-                if isinstance(delta, dict):
-                    content = delta.get("content")
-                    if isinstance(content, str):
-                        completion_parts.append(content)
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
+        with tracer.start_as_current_span("provider_call"):
+            async for chunk in provider.stream_chat_completion(body):
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") if isinstance(choice, dict) else None
+                    if isinstance(delta, dict):
+                        content = delta.get("content")
+                        if isinstance(content, str):
+                            completion_parts.append(content)
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
     except ProviderError as exc:
         succeeded = False
         error_payload = openai_error(str(exc), error_type="upstream_error", code="provider_error")
         yield f"data: {json.dumps(error_payload)}\n\n".encode()
     finally:
+        outcome = "success" if succeeded else "error"
+        provider_call_duration_seconds.labels(provider=provider.name, outcome=outcome).observe(
+            time.monotonic() - provider_call_start
+        )
+        if not succeeded:
+            chat_completions_total.labels(provider=provider.name, outcome="error").inc()
+
         completion_text = "".join(completion_parts)
         completion_tokens = count_text_tokens(completion_text, body.model)
         logger.info(

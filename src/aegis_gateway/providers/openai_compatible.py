@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from aegis_gateway.core.metrics import set_circuit_breaker_state
 from aegis_gateway.providers.circuit_breaker import CircuitBreaker
 from aegis_gateway.providers.errors import (
     ProviderError,
@@ -67,15 +68,19 @@ class OpenAICompatibleProvider:
             )
         except httpx.TimeoutException as exc:
             await self._breaker.record_failure()
+            set_circuit_breaker_state(self.name, self._breaker.state.value)
             raise UpstreamTimeoutError(str(exc)) from exc
         except httpx.ConnectError as exc:
             await self._breaker.record_failure()
+            set_circuit_breaker_state(self.name, self._breaker.state.value)
             raise UpstreamConnectionError(str(exc)) from exc
         except UpstreamStatusError:
             await self._breaker.record_failure()
+            set_circuit_breaker_state(self.name, self._breaker.state.value)
             raise
         else:
             await self._breaker.record_success()
+            set_circuit_breaker_state(self.name, self._breaker.state.value)
             return result
 
     async def _post_once(self, payload: dict[str, Any]) -> dict[str, Any]:
